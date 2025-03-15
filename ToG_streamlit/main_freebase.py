@@ -1,11 +1,10 @@
 from tqdm import tqdm
 import argparse
-import random
-from wiki_func import *
-from client import *
 from utils import *
-from wiki_spasql import relation_search_prune_API_ver2
+from freebase_func import *
 import random
+from client import *
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -31,47 +30,28 @@ if __name__ == '__main__':
                         default=5, help="Number of entities retained during entities search.")
     parser.add_argument("--prune_tools", type=str,
                         default="llm", help="prune tools for ToG, can be llm (same as LLM_type), bm25 or sentencebert.")
-    parser.add_argument("--addr_list", type=str,
-                        default="server_urls.txt", help="The address of the Wikidata service.")
     args = parser.parse_args()
-        
+
     datas, question_string = prepare_dataset(args.dataset)
     print("Start Running ToG on %s dataset." % args.dataset)
-    random_datas = random.sample(datas, 1000)
-    for data in tqdm(random_datas):
+    for data in tqdm(datas):
         question = data[question_string]
-        topic_entity = data['qid_topic_entity']
+        topic_entity = data['topic_entity']
         cluster_chain_of_entities = []
         if len(topic_entity) == 0:
             results = generate_without_explored_paths(question, args)
             save_2_jsonl(question, results, [], file_name=args.dataset)
-            # continue
+            continue
         pre_relations = []
         pre_heads= [-1] * len(topic_entity)
         flag_printed = False
-        with open(args.addr_list, "r") as f:
-            server_addrs = f.readlines()
-            server_addrs = [addr.strip() for addr in server_addrs]
-        # print(f"Server addresses: {server_addrs}")
-        wiki_client = MultiServerWikidataQueryClient(server_addrs)
-        wiki_id_to_label = {}
-        wiki_id_to_label.update(topic_entity)
-        wiki_label_to_id = {}
         for depth in range(1, args.depth+1):
             current_entity_relations_list = []
-            current_entity_names = {} 
-            current_entity_ids = {}
             i=0
             for entity in topic_entity:
                 if entity!="[FINISH_ID]":
-                    retrieve_relations_with_scores, entity_names, entity_ids, id_to_label, label_to_id = relation_search_prune_API_ver2(entity, topic_entity[entity], pre_relations, pre_heads[i], question, args, wiki_client)  # best entity triplet, entitiy_id
-                    
-                    current_entity_ids[entity] = entity_ids 
-                    current_entity_names[entity] = entity_names 
-                    wiki_id_to_label.update(id_to_label) 
-                    wiki_label_to_id.update(label_to_id)
+                    retrieve_relations_with_scores = relation_search_prune(entity, topic_entity[entity], pre_relations, pre_heads[i], question, args)  # best entity triplet, entitiy_id
                     current_entity_relations_list.extend(retrieve_relations_with_scores)
-                    
                 i+=1
             total_candidates = []
             total_scores = []
@@ -81,43 +61,27 @@ if __name__ == '__main__':
             total_head = []
 
             for entity in current_entity_relations_list:
-                value_flag=False
-                # if entity['head']:
-                #     entity_candidates_id, entity_candidates_name = entity_search(entity['entity'], entity['relation'], wiki_client, True)
-                # else:
-                #     entity_candidates_id, entity_candidates_name = entity_search(entity['entity'], entity['relation'], wiki_client, False)
-                # có thể có bug chỗ này 
-                if entity['relation'] not in current_entity_ids[entity['entity']] or entity['relation'] not in current_entity_names[entity['entity']]: 
-                    continue 
-                entity_candidates_id = current_entity_ids[entity['entity']][entity['relation']]
-                entity_candidates_name = current_entity_names[entity['entity']][entity['relation']]
-                if len(entity_candidates_name)==0:
-                    continue
-                if len(entity_candidates_id) ==0: # values
-                    value_flag=True
-                    if len(entity_candidates_name) >=20:
-                        entity_candidates_name = random.sample(entity_candidates_name, 10)
-                    entity_candidates_id = ["[FINISH_ID]"] * len(entity_candidates_name)
-                else: # ids
-                    entity_candidates_id, entity_candidates_name = del_all_unknown_entity(entity_candidates_id, entity_candidates_name)
+                if entity['head']:
+                    entity_candidates_id = entity_search(entity['entity'], entity['relation'], True)
+                else:
+                    entity_candidates_id = entity_search(entity['entity'], entity['relation'], False)
+                
+                if args.prune_tools == "llm":
                     if len(entity_candidates_id) >=20:
-                        indices = random.sample(range(len(entity_candidates_name)), 10)
-                        entity_candidates_id = [entity_candidates_id[i] for i in indices]
-                        entity_candidates_name = [entity_candidates_name[i] for i in indices]
+                        entity_candidates_id = random.sample(entity_candidates_id, args.num_retain_entity)
 
                 if len(entity_candidates_id) ==0:
                     continue
-
-                scores, entity_candidates, entity_candidates_id = entity_score(question, entity_candidates_id, entity_candidates_name, entity['score'], entity['relation'], args)
+                scores, entity_candidates, entity_candidates_id = entity_score(question, entity_candidates_id, entity['score'], entity['relation'], args)
                 
-                total_candidates, total_scores, total_relations, total_entities_id, total_topic_entities, total_head = update_history(entity_candidates, entity, scores, entity_candidates_id, total_candidates, total_scores, total_relations, total_entities_id, total_topic_entities, total_head, value_flag)
+                total_candidates, total_scores, total_relations, total_entities_id, total_topic_entities, total_head = update_history(entity_candidates, entity, scores, entity_candidates_id, total_candidates, total_scores, total_relations, total_entities_id, total_topic_entities, total_head)
             
             if len(total_candidates) ==0:
                 half_stop(question, cluster_chain_of_entities, depth, args)
                 flag_printed = True
                 break
                 
-            flag, chain_of_entities, entities_id, pre_relations, pre_heads = entity_prune(total_entities_id, total_relations, total_candidates, total_topic_entities, total_head, total_scores, args, wiki_client, wiki_id_to_label)
+            flag, chain_of_entities, entities_id, pre_relations, pre_heads = entity_prune(total_entities_id, total_relations, total_candidates, total_topic_entities, total_head, total_scores, args)
             cluster_chain_of_entities.append(chain_of_entities)
             if flag:
                 stop, results = reasoning(question, cluster_chain_of_entities, args)
@@ -133,7 +97,7 @@ if __name__ == '__main__':
                         half_stop(question, cluster_chain_of_entities, depth, args)
                         flag_printed = True
                     else:
-                        topic_entity = {qid: topic for qid, topic in zip(entities_id, [wiki_id_to_label[entity] for entity in entities_id])}
+                        topic_entity = {entity: id2entity_name_or_type(entity) for entity in entities_id}
                         continue
             else:
                 half_stop(question, cluster_chain_of_entities, depth, args)
